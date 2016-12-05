@@ -16,6 +16,7 @@ build_ami() {
 	setup_network
 	install_grub
 	enter_shell
+	maybe_copy_root
 	unmount_all
 	bundle_ami
 	upload_ami
@@ -33,6 +34,13 @@ get_root_device() {
 }
 
 
+maybe_copy_root() {
+	if [[ $NUM_ROOT_PARTITIONS -eq 2 ]]; then
+		rsync -a --exclude dev --exclude proc --exclude sys $AMI_MNT/ ${AMI_MNT}2/
+	fi
+}
+
+
 # Create the build hierarchy.  Unmount existing paths first, if need by
 make_build_dirs() {
 
@@ -43,16 +51,20 @@ make_build_dirs() {
 
 	AMI_DEV=hda
 	AMI_DEV_PATH=/dev/mapper/$AMI_DEV
-	AMI_PART_PATH=${AMI_DEV_PATH}1
 
 	output "Creating build hierarchy in $AMI_ROOT..."
 
+	# Check if any of $AMI_MNT or ${AMI_MNT}2 are mounted (notice, no trailing space).
 	if grep -q "^[^ ]\+ $AMI_MNT" /proc/mounts; then
 		yesno "$AMI_MNT is already mounted; unmount it"
 		unmount_all
 	fi
 
-	mkdir -p $AMI_MNT $AMI_OUT || fatal "Unable to create create build hierarchy"
+	mkdir -p $AMI_MNT $AMI_OUT || fatal "Unable to create build hierarchy"
+
+	if [[ $NUM_ROOT_PARTITIONS -eq 2 ]]; then
+		mkdir -p ${AMI_MNT}2 || fatal "Unable to create build for second root partition"
+	fi
 
 }
 
@@ -85,14 +97,21 @@ make_img_file() {
 			fatal "Unable to create image file: $AMI_IMG"
 
 		# Create a primary partition
-		parted $AMI_IMG --script -- "unit s mklabel msdos mkpart primary 2048 100% set 1 boot on print quit" \
+		parted $AMI_IMG --script -- \
+		  "unit s " \
+		  "mklabel msdos " \
+		  "mkpart primary 2048 30% " \
+		  "mkpart primary 30% 60% " \
+		  "mkpart primary 60% 100% " \
+		  "set 1 boot on " \
+		  "print quit" \
 			 || fatal "Unable to create primary partition for $AMI_IMG"
 		sync; udevadm settle
 
 		# Set up the the image file as a loop device so we can create a dm volume for it
 		LOOP_DEV=$(losetup -f)
 		losetup $LOOP_DEV $AMI_IMG || fatal "Failed to bind $AMI_IMG to $LOOP_DEV."
-		
+
 		# Create a device mapper volume from our loop dev
 		DM_SIZE=$(($AMI_SIZE * 2048))
 		DEV_NUMS=$(cat /sys/block/$(basename $LOOP_DEV)/dev)
@@ -103,10 +122,13 @@ make_img_file() {
 		udevadm settle
 
 		# Create our xfs partition and clone our builder root UUID onto it
-		mkfs.xfs -f $AMI_PART_PATH  || \
+		for part in 1 2 3; do
+		  AMI_PART_PATH=${AMI_DEV_PATH}$part
+		  mkfs.xfs -f $AMI_PART_PATH  || \
 			fatal "Unable to create XFS filesystem on $AMI_PART_PATH"
-		xfs_admin -U $ROOT_UUID $AMI_PART_PATH  || \
+		  xfs_admin -U $ROOT_UUID $AMI_PART_PATH  || \
 			fatal "Unable to assign UUID '$ROOT_UUID' to $AMI_PART_PATH"
+		done
 		sync
 	fi
 }
@@ -121,6 +143,9 @@ mount_img_file()
 		mount -o nouuid $AMI_IMG $AMI_MNT
 	else
 		mount -o nouuid /dev/mapper/hda1 $AMI_MNT
+		if [[ $NUM_ROOT_PARTITIONS -eq 2 ]]; then
+			mount -o nouuid /dev/mapper/hda2 ${AMI_MNT}2
+		fi
 	fi
 
 	# Make our chroot directory hierarchy
@@ -391,12 +416,29 @@ enter_shell() {
 }
 
 
+# Unmount a build root directory.
+unmount_root() {
+        mntdir=$1
+        for m in dev/pts dev/shm dev proc sys; do
+	    if grep -q "^[^ ]\+ $mntdir/$m " /proc/mounts; then
+	        umount -ldf $mntdir/$m
+            fi
+        done
+	if grep -q "^[^ ]\+ $mntdir " /proc/mounts; then
+	    umount -ldf $mntdir
+        fi
+	sync
+	grep -q "^[^ ]\+ $mntdir " /proc/mounts && \
+		fatal "Failed to unmount all devices mounted under $mntdir!"
+}
+
+
 # Unmount all of the mounted devices
 unmount_all() {
-	umount -ldf $AMI_MNT/{dev/pts,dev/shm,dev,proc,sys,}
-	sync
-	grep -q "^[^ ]\+ $AMI_MNT" /proc/mounts && \
-		fatal "Failed to unmount all devices mounted under $AMI_MNT!"
+	unmount_root $AMI_MNT
+	if [[ $NUM_ROOT_PARTITIONS -eq 2 ]]; then
+		unmount_root ${AMI_MNT}2
+	fi
 
 	# Also undefine our hvm devices if they are currently set up with this image file
 	losetup | grep -q $AMI_IMG && undefine_hvm_dev
@@ -497,6 +539,7 @@ get_config_opts() {
 
 	get_input "Path to local build folder (i.e. /mnt/amis)" "BUILD_ROOT"
 	get_input "AMI size (in MB)" "AMI_SIZE"
+        get_input "Number of root partitions (1 or 2)" "NUM_ROOT_PARTITIONS"
 	get_input "AWS User ID #" "AWS_USER"
 	get_input "Path to S3 AMI storage (i.e. bucket/dir)" "S3_ROOT"
 	get_input "S3 bucket region (i.e. us-west-2)" "S3_REGION"
@@ -520,7 +563,7 @@ get_config_opts() {
 	rm -f $CFG_FILE
 	touch $CFG_FILE
 	chmod 600 $CFG_FILE
-	for f in BUILD_ROOT AMI_SIZE AWS_USER S3_ROOT S3_REGION AWS_ACCESS AWS_SECRET AWS_PRIVATE_KEY AWS_CERT; do
+	for f in BUILD_ROOT AMI_SIZE NUM_ROOT_PARTITIONS AWS_USER S3_ROOT S3_REGION AWS_ACCESS AWS_SECRET AWS_PRIVATE_KEY AWS_CERT; do
 		eval echo $f=\"\$$f\" >> $CFG_FILE
 	done
 
@@ -564,6 +607,7 @@ sanity_check() {
 	(( "$AMI_SIZE" >= 1000 )) || fatal "AMI size must be at least 1000 MB (currently $AMI_SIZE MB!)"
     (( "$AMI_SIZE" <= 8192 )) || fatal "AMI size should be no more than 8192 (8GB)"
 
+	[[ $NUM_ROOT_PARTITIONS -eq 1 || $NUM_ROOT_PARTITIONS -eq 2 ]] || fatal "Number of root partitions must be 1 or 2"
 
 	# Check for ket/cert existance
 	[[ ! -f $AWS_PRIVATE_KEY ]] && fatal "EC2 private key '$AWS_PRIVATE_KEY' doesn't exist!"
